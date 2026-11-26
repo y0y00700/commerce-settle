@@ -159,8 +159,11 @@ def compose(*args, input_text=None, timeout=600):
 
 
 def sql(database, statement, timeout=600):
-    return compose("exec", "-T", "postgres", "psql", "-U", "postgres", "-d", database, "-At",
-                   "-v", "ON_ERROR_STOP=1", input_text=statement, timeout=timeout).stdout.strip()
+    try:
+        return compose("exec", "-T", "postgres", "psql", "-U", "postgres", "-d", database, "-At",
+                       "-v", "ON_ERROR_STOP=1", input_text=statement, timeout=timeout).stdout.strip()
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"psql failed on {database}: {error.stderr.strip()[-2000:]}") from None
 
 
 def settlement_http(method, url, body=None, credential=None):
@@ -312,8 +315,8 @@ def cmd_seed(args):
             'PAYABLE', x.r, 0, NULL, x.r - interval '8 days', x.r, 0
         FROM ({rows}) s, generate_series(1, s.c) j,
             LATERAL (SELECT timestamptz '{cutoff.isoformat()}'
-                         - make_interval(secs => 1 + ((s.n * 7919 + j * 104729) % 86000)) AS r,
-                     (1000 + ((s.n * 31 + j * 17) % 991) * 100)::bigint AS a) x;
+                         - make_interval(secs => 1 + ((s.n * 7919 + j::bigint * 104729) % 86000)) AS r,
+                     (1000 + ((s.n * 31 + j::bigint * 17) % 991) * 100)::bigint AS a) x;
         COMMIT;
         VACUUM ANALYZE settlement.settlement_items;""", timeout=1800)
     elapsed = time.monotonic() - started
