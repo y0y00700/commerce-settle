@@ -8322,6 +8322,75 @@
         }
       }
     },
+    "/internal/perf/daily-settlement-runs": {
+      "post": {
+        "operationId": "post_internal_perf_daily_settlement_runs",
+        "summary": "측정용 일배치 시작",
+        "tags": [
+          "settlement"
+        ],
+        "x-owner-service": "settlement",
+        "x-actor": "OPERATOR",
+        "x-implemented": true,
+        "description": "성능 측정 전용. settlement.perf.trigger-enabled=true일 때만 등록되며 기본은 꺼져 있다. 정기 10:00 일배치와 같은 실행 경로로 batchDate의 일배치를 비동기로 시작한다. 마감이 지나지 않은 batchDate는 400 COMMON_VALIDATION_FAILED. 실행 결과는 Spring Batch 실행 기록에서 확인하며, 이미 완료된 batchDate는 새로 실행하지 않는다.",
+        "security": [
+          {
+            "serviceCredential": []
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "비동기 접수; 배치 완료 아님",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "batchDate": {
+                      "type": "string",
+                      "format": "date"
+                    }
+                  },
+                  "required": [
+                    "batchDate"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "batchDate": {
+                    "type": "string",
+                    "format": "date"
+                  }
+                },
+                "required": [
+                  "batchDate"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
     "/internal/payment-reconciliation-events": {
       "get": {
         "operationId": "get_internal_payment_reconciliation_events",

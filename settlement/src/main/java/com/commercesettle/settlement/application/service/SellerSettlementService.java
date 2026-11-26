@@ -14,7 +14,12 @@ import com.commercesettle.settlement.domain.repository.PayoutRepository;
 import com.commercesettle.settlement.domain.repository.SettlementBatchRepository;
 import com.commercesettle.settlement.domain.repository.SettlementItemRepository;
 import com.commercesettle.settlement.domain.repository.SettlementItemRepository.ReservedItem;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.List;
@@ -22,6 +27,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Supplier;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -30,6 +37,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * 판매자 한 명의 일배치. 커머스 지급 컨텍스트는 DB 트랜잭션 밖에서 조회한다. 지급 선점·저장은 판매자 단위 트랜잭션으로 처리하고, 선점 시 현재 상태와 검증한 상품 집합을
  * 다시 확인한다. 대상 선점·지급 예약·합계·배치·지급·지급 작업과 정산 확정 알림 요청은 그 한 트랜잭션에 고정하며, 지급 전 검증에 실패하면 선점까지 롤백해 항목이
  * PAYABLE로 남고 다음 실행에서 다시 고려된다.
+ *
+ * <p>판매자 한 명의 처리 시간을 단계별 Timer({@code settlement.batch.seller.phase})로 남긴다. 일배치와 운영 요청이 같은 단계를 거치므로
+ * 둘 다 집계된다. 일배치에서 건너뛴 판매자는 Spring Batch가 chunk를 다시 실행해 확인하므로 두 번 기록된다.
  */
 @Service
 public class SellerSettlementService {
@@ -43,6 +53,12 @@ public class SellerSettlementService {
   private final Clock clock;
   private final TransactionTemplate transactions;
   private final TransactionTemplate reads;
+  private final Timer existingPhase;
+  private final Timer productsPhase;
+  private final Timer contextPhase;
+  private final Timer reservePhase;
+  private final DistributionSummary productsPerSeller;
+  private final DistributionSummary itemsPerSeller;
 
   public SellerSettlementService(
       SettlementItemRepository items,
@@ -53,7 +69,8 @@ public class SellerSettlementService {
       DailySettlementSettings settings,
       SettlementNoticeService notices,
       Clock clock,
-      PlatformTransactionManager manager) {
+      PlatformTransactionManager manager,
+      ObjectProvider<MeterRegistry> meters) {
     this.items = items;
     this.batches = batches;
     this.payouts = payouts;
@@ -65,6 +82,39 @@ public class SellerSettlementService {
     this.transactions = new TransactionTemplate(manager);
     this.reads = new TransactionTemplate(manager);
     this.reads.setReadOnly(true);
+    MeterRegistry registry = meters.getIfAvailable(SimpleMeterRegistry::new);
+    this.existingPhase = phase(registry, "existing");
+    this.productsPhase = phase(registry, "products");
+    this.contextPhase = phase(registry, "context");
+    this.reservePhase = phase(registry, "reserve");
+    this.productsPerSeller =
+        DistributionSummary.builder("settlement.batch.seller.products")
+            .description("배치를 새로 만든 판매자 한 명의 지급 대상 상품 수")
+            .publishPercentileHistogram()
+            .minimumExpectedValue(1.0)
+            .maximumExpectedValue(1_000.0)
+            .register(registry);
+    this.itemsPerSeller =
+        DistributionSummary.builder("settlement.batch.seller.items")
+            .description("판매자 한 명의 지급 선점 항목 수. 선점 뒤 검증 실패로 롤백된 시도도 포함한다")
+            .publishPercentileHistogram()
+            .minimumExpectedValue(1.0)
+            .maximumExpectedValue(100_000.0)
+            .register(registry);
+  }
+
+  private static Timer phase(MeterRegistry registry, String phase) {
+    return Timer.builder("settlement.batch.seller.phase")
+        .description("판매자 한 명의 정산 단계별 처리 시간")
+        .tag("phase", phase)
+        .publishPercentileHistogram()
+        .minimumExpectedValue(Duration.ofMillis(1))
+        .maximumExpectedValue(Duration.ofSeconds(30))
+        .register(registry);
+  }
+
+  private static <T> T timed(Timer timer, Supplier<T> work) {
+    return timer.record(work);
   }
 
   /**
@@ -107,7 +157,12 @@ public class SellerSettlementService {
     if (prepared.productIds().isEmpty()) {
       return Optional.empty();
     }
-    return transactions.execute(status -> reserve(prepared));
+    Optional<Settled> settled =
+        timed(reservePhase, () -> transactions.execute(status -> reserve(prepared)));
+    settled
+        .filter(Settled::created)
+        .ifPresent(ignored -> productsPerSeller.record(prepared.productIds().size()));
+    return settled;
   }
 
   /**
@@ -162,17 +217,23 @@ public class SellerSettlementService {
 
   private Prepared prepare(UUID sellerId, LocalDate batchDate, Set<UUID> itemIds) {
     Optional<SettlementBatch> existing =
-        reads.execute(status -> existingBatch(sellerId, batchDate, itemIds));
+        timed(
+            existingPhase,
+            () -> reads.execute(status -> existingBatch(sellerId, batchDate, itemIds)));
     if (existing.isPresent()) {
       return new Prepared(sellerId, batchDate, itemIds, existing.get(), Set.of(), null, null);
     }
     Instant cutoffAt = SettlementBatch.cutoffOf(batchDate);
-    Set<UUID> productIds = reads.execute(status -> items.findPayableProductIds(sellerId, cutoffAt));
+    Set<UUID> productIds =
+        timed(
+            productsPhase,
+            () -> reads.execute(status -> items.findPayableProductIds(sellerId, cutoffAt)));
     if (productIds.isEmpty()) {
       return new Prepared(sellerId, batchDate, itemIds, null, Set.of(), null, null);
     }
     PayoutRecipient recipient =
-        PayoutRecipient.resolve(sellerId, productIds, contexts.read(sellerId, productIds));
+        PayoutRecipient.resolve(
+            sellerId, productIds, timed(contextPhase, () -> contexts.read(sellerId, productIds)));
     return new Prepared(sellerId, batchDate, itemIds, null, productIds, recipient, null);
   }
 
@@ -233,6 +294,7 @@ public class SellerSettlementService {
     if (reserved.stream().anyMatch(item -> !productIds.contains(item.productId()))) {
       throw new PayoutNotAllowedException("an unverified product was reserved");
     }
+    itemsPerSeller.record(reserved.size());
     long netAmount = reserved.stream().mapToLong(ReservedItem::netAmount).sum();
 
     SettlementBatch batch =
