@@ -46,7 +46,13 @@ class PayoutWorkerSchedulerTest {
   private final AtomicInteger runningNew = new AtomicInteger();
   private final AtomicInteger runningRecovery = new AtomicInteger();
   private final AtomicInteger finished = new AtomicInteger();
+  private final AtomicInteger maxNew = new AtomicInteger();
+  private final AtomicInteger runningTotal = new AtomicInteger();
+  private final AtomicInteger maxTotal = new AtomicInteger();
+  private final AtomicInteger recoveryFinished = new AtomicInteger();
   private final CountDownLatch hold = new CountDownLatch(1);
+  private volatile long workMillis;
+  private volatile CountDownLatch failGate = new CountDownLatch(0);
   private final ExecutorService pool = Executors.newCachedThreadPool();
   private PayoutWorker worker;
 
@@ -60,11 +66,19 @@ class PayoutWorkerSchedulerTest {
               LeasedJob job = call.getArgument(0);
               AtomicInteger counter = job.attempts() == 0 ? runningNew : runningRecovery;
               counter.incrementAndGet();
+              maxNew.accumulateAndGet(runningNew.get(), Math::max);
+              maxTotal.accumulateAndGet(runningTotal.incrementAndGet(), Math::max);
               try {
-                if (failing.contains(job.jobId())) throw new IllegalStateException("injected");
+                if (failing.contains(job.jobId())) {
+                  failGate.await();
+                  throw new IllegalStateException("injected");
+                }
                 hold.await();
+                TimeUnit.MILLISECONDS.sleep(workMillis);
               } finally {
+                runningTotal.decrementAndGet();
                 counter.decrementAndGet();
+                if (counter == runningRecovery) recoveryFinished.incrementAndGet();
                 finished.incrementAndGet();
               }
               return null;
@@ -163,6 +177,97 @@ class PayoutWorkerSchedulerTest {
     PayoutWorkerScheduler scheduler = new PayoutWorkerScheduler(worker, pool, SETTINGS);
     scheduler.poll();
     awaitRunning(runningNew, 6);
+  }
+
+  @Test
+  @DisplayName("작업을 마친 슬롯은 다음 폴링을 기다리지 않고 도래한 새 지급을 이어서 실행한다")
+  void finishedSlotContinuesWithoutNextPoll() throws InterruptedException {
+    addDue(LeaseKind.NEW, 60);
+    hold.countDown();
+    workMillis = 2;
+    PayoutWorkerScheduler scheduler = new PayoutWorkerScheduler(worker, pool, SETTINGS);
+
+    scheduler.poll();
+    awaitFinished(60);
+
+    assertThat(due.get(LeaseKind.NEW)).isEmpty();
+    assertThat(maxNew.get()).isLessThanOrEqualTo(6);
+  }
+
+  @Test
+  @DisplayName("이어서 실행해도 새 지급은 6건, 전체는 8건을 넘지 않는다")
+  void continuationKeepsSlotLimits() throws InterruptedException {
+    addDue(LeaseKind.NEW, 80);
+    hold.countDown();
+    workMillis = 2;
+    PayoutWorkerScheduler scheduler = new PayoutWorkerScheduler(worker, pool, SETTINGS);
+    scheduler.poll();
+    // 새 지급이 이어서 도는 중에 복구가 도래해 두 종류가 섞여 실행되게 한다.
+    awaitFinished(6);
+    addDue(LeaseKind.RECOVERY, 80);
+
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (finished.get() < 160) {
+      assertThat(System.nanoTime()).as("작업이 끝나지 않았다").isLessThan(deadline);
+      scheduler.poll();
+      TimeUnit.MILLISECONDS.sleep(5);
+    }
+
+    assertThat(maxNew.get()).isLessThanOrEqualTo(6);
+    assertThat(maxTotal.get()).isLessThanOrEqualTo(8);
+  }
+
+  @Test
+  @DisplayName("새 지급 적체가 남아 있어도 작업을 마친 슬롯은 도래한 복구를 먼저 이어받는다")
+  void continuationPrefersRecovery() throws InterruptedException {
+    // 적체가 테스트 스레드 지연 동안 다 빠지지 않을 만큼 넉넉히 둔다(슬롯 6개 × 2ms로 약 1초).
+    addDue(LeaseKind.NEW, 3000);
+    hold.countDown();
+    workMillis = 2;
+    PayoutWorkerScheduler scheduler = new PayoutWorkerScheduler(worker, pool, SETTINGS);
+    scheduler.poll();
+    awaitFinished(12);
+
+    addDue(LeaseKind.RECOVERY, 30);
+    awaitValue(recoveryFinished, 30);
+
+    // 폴링 없이 새 지급 슬롯이 복구를 먼저 받았으므로 새 지급 적체가 다 빠지기 전에 복구가 끝난다.
+    assertThat(due.get(LeaseKind.NEW)).isNotEmpty();
+  }
+
+  @Test
+  @DisplayName("실행이 예외로 끝난 슬롯은 남은 작업을 이어서 임대하지 않는다")
+  void failedSlotDoesNotContinue() throws InterruptedException {
+    for (int i = 0; i < 6; i++) failing.add(addDue(LeaseKind.NEW, 1));
+    addDue(LeaseKind.NEW, 6);
+    failGate = new CountDownLatch(1);
+    PayoutWorkerScheduler scheduler = new PayoutWorkerScheduler(worker, pool, SETTINGS);
+
+    // 폴링이 끝난 뒤에 실패시켜, 남은 작업을 가져갈 수 있는 경로가 이어받기뿐이게 한다.
+    scheduler.poll();
+    failGate.countDown();
+    awaitFinished(6);
+    TimeUnit.MILLISECONDS.sleep(100);
+
+    assertThat(finished).hasValue(6);
+    assertThat(due.get(LeaseKind.NEW)).hasSize(6);
+  }
+
+  @Test
+  @DisplayName("종료 중에는 실행 중인 작업만 마치고 다음 작업을 이어서 임대하지 않는다")
+  void stoppingDoesNotContinue() throws InterruptedException {
+    addDue(LeaseKind.NEW, 12);
+    PayoutWorkerScheduler scheduler = new PayoutWorkerScheduler(worker, pool, SETTINGS);
+    scheduler.poll();
+    awaitRunning(runningNew, 6);
+
+    scheduler.stop();
+    hold.countDown();
+    awaitFinished(6);
+    TimeUnit.MILLISECONDS.sleep(100);
+
+    assertThat(finished).hasValue(6);
+    assertThat(due.get(LeaseKind.NEW)).hasSize(6);
   }
 
   /** 마지막에 넣은 작업 ID를 돌려준다. 새 지급은 시도 0, 복구는 시도 1로 구분한다. */
