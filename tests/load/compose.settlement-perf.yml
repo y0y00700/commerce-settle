@@ -1,0 +1,13 @@
+# 정산 일배치 측정 전용 overlay. 정기 10:00 실행과 지급 Worker를 끄고 측정용 시작 API와 운영자 자격만 켠다.
+#   PERF_OPERATOR_CREDENTIAL=$(cat tests/load/work/settlement-perf.credential) \
+#     docker compose -f compose.yml -f tests/load/compose.settlement-perf.yml up -d --build --wait
+# 자격 파일은 `python3 -B tests/load/settlement_seed.py up`이 무작위로 만든다.
+services:
+  settlement:
+    environment:
+      SETTLEMENT_PERF_TRIGGER_ENABLED: 'true'
+      # 강제 종료 복구(S6)는 기동 시 복구가 스케줄러에 있으므로 true로 켠다. 10:00 정기 실행도 함께 켜지므로 시험 뒤 끈다.
+      SETTLEMENT_DAILY_BATCH_ENABLED: ${PERF_DAILY_BATCH_ENABLED:-false}
+      # 지급 처리량(S5)을 잴 때만 true로 켠다.
+      SETTLEMENT_PAYOUT_WORKER_ENABLED: ${PERF_PAYOUT_WORKER_ENABLED:-false}
+      SPRING_APPLICATION_JSON: '{"app":{"internal-auth":{"senders":{"[operator:perf]":{"current":"${PERF_OPERATOR_CREDENTIAL:?Run python3 -B tests/load/settlement_seed.py up}"}}}}}'

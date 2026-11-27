@@ -136,6 +136,13 @@ class DailySettlementObservabilityIntegrationTest {
     assertThat(items("read")).isEqualTo(1);
     assertThat(items("written")).isEqualTo(1);
     assertThat(items("skipped")).isZero();
+    for (String phase : List.of("existing", "products", "context", "reserve")) {
+      assertThat(meters.get("settlement.batch.seller.phase").tag("phase", phase).timer().count())
+          .as(phase)
+          .isEqualTo(1);
+    }
+    assertThat(meters.get("settlement.batch.seller.products").summary().totalAmount()).isEqualTo(1);
+    assertThat(meters.get("settlement.batch.seller.items").summary().totalAmount()).isEqualTo(1);
     // COMPLETED means the seller transaction committed a pending payout, not a bank transfer.
     assertThat(jdbc.queryForObject("SELECT status FROM settlement.payouts", String.class))
         .isEqualTo("PENDING");

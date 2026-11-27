@@ -372,3 +372,24 @@ LOAD_NAMESPACE=r1 python3 -B tests/load/payment_load.py reconcile --runs r1-base
 동일한 이미지·인스턴스·DB 초기 조건에서 60초간 초당 200건을 일정하게 보냅니다. 유한 재고 시험 상품과 충분한 재고의 정상 상품에 같은 비율로 요청을 분배합니다. 각 회차의 실제 도착 수를 확인하고 정상 상품 p99, 예상된 품절 응답, 재고 쓰기 잠금 대기, Payment DB 확정 건수를 비교합니다. 이 시험의 품절 응답은 정상 주문 성공률에서 별도로 집계합니다. `experiment.py`의 15분 결제 확정 200 TPS 시험은 충분한 정상 재고로 별도 실행합니다.
 
 회차 종료 후 시험용 Redis 키를 지우고 Commerce 설정을 비웁니다.
+
+## 정산 일배치 규모 시험
+
+[settlement_seed.py](settlement_seed.py)는 지급 대상(PAYABLE) 정산 항목과 이를 검증할 커머스 판매자·상품을 DB에 직접 만들고, 측정용 시작 API로 일배치를 실행해 판매자 단계별 처리 시간과 정합성을 남깁니다. 원장 반영·이벤트 경로와 Payment ↔ Settlement 대조는 포함하지 않습니다.
+
+```bash
+python3 -B tests/load/settlement_seed.py up        # 운영자 자격 생성, 기동 명령 출력
+PERF_OPERATOR_CREDENTIAL=$(cat tests/load/work/settlement-perf.credential) \
+  docker compose -f compose.yml -f tests/load/compose.settlement-perf.yml -f compose.financial-flow.yml \
+  up -d --wait settlement
+python3 -B tests/load/settlement_seed.py seed --profile small --batch-date 2026-01-05 --run-id s1
+python3 -B tests/load/settlement_seed.py run --run-id s1
+python3 -B tests/load/settlement_seed.py report --run-id s1
+python3 -B tests/load/settlement_seed.py clean --run-id s1 --commerce
+```
+
+- overlay는 정기 10:00 실행과 지급 Worker를 끄고 `POST /internal/perf/daily-settlement-runs`(기본 비활성, `operator:*` 자격)를 켭니다.
+- 프로파일: `small` 판매자 1,000·항목 1만 균등, `medium` 5,000·10만(상위 1%가 70%), `large` 2만·27만(상위 1%가 70%, 최대 판매자 10%). 판매자당 상품은 5개(최대 판매자 50개)이며 `--products-per-seller`로 고정합니다.
+- 회차마다 새 `batchDate`를 씁니다. 같은 날짜의 완료 실행은 다시 실행되지 않으며, 시드 밖의 지급 대상이 마감 전에 있으면 실행을 거절합니다.
+- `run.json`의 `phasesMs`는 `settlement.batch.seller.phase`(기존 확인·대상 상품 조회·커머스 지급 컨텍스트·선점 저장)의 실행 전후 차이입니다. 건너뛴 판매자는 Spring Batch의 chunk 재확인으로 두 번 기록됩니다. 백분위수는 히스토그램 bucket 상한입니다.
+- 결과는 Git에서 제외한 `tests/load/work/settlement-<run-id>/`에 남습니다. Spring Batch 실행 기록은 `clean` 뒤에도 보존합니다.
