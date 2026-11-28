@@ -1,7 +1,7 @@
 # 지급 작업 적체를 신규 주문 접수 gate에서 분리
 
 - 제안일: 2026-11-29
-- 상태: 제안 (개인 fork 개선 작업. 팀 결정 절차 없음)
+- 상태: 채택 (2026-11-29, 개인 fork 개선 작업. 팀 결정 절차 없음). 구현·재측정 전
 - 범위: Commerce 신규 주문 접수 gate([업무 정책](../policies.md#신규-접수-제한과-재개))의 필수 관측 중 `settlement.payout_jobs`
 - 연결 문서: [정산 일배치 범위·실행 시각](0007-settlement-batch-scope-and-schedule.md) D2, [Kafka 전달과 처리 용량](0005-kafka-event-delivery-and-capacity.md), [운영 알람](../policies.md#운영-알람)
 
